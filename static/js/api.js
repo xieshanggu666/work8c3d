@@ -67,6 +67,7 @@ const API = {
   reportWaterDelivery: (id, body) => API.post(`/api/water-supply/${id}/delivery`, body),
   addWaterEmergency: (id, body) => API.post(`/api/water-supply/${id}/emergency`, body),
   completeWaterSupply: (id, body) => API.post(`/api/water-supply/${id}/complete`, body),
+  adjustWaterSupply: (id, body) => API.post(`/api/water-supply/${id}/adjust`, body),
 };
 
 /* 全局运行状态：跨视图共享最近一次预报结果 / 运行记录 */

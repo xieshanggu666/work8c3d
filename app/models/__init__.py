@@ -412,8 +412,12 @@ class WaterSupplyPlan(Base):
     异常欠供（实际供水 < 计划水量）时由物资管理员追加应急物资
     (WaterSupplyEmergency)，应急出库复用应急物资库存池，并可挂接原有
     防汛处置单（disposal_id）兼容既有处置记录。
+    审核闭环（completed）后支持滚动调整配水（adjust_round 递增）：保留
+    已供水量与应急出库记录，乡镇重新确认优先级后再次执行；每轮完成只按
+    累计实供的增量扣减库容，重复完成零增量不重复扣库容/写台账。
     状态机：submitted（待审核）→ reviewed（已审核，待乡镇确认优先级）
-    → executing（执行配水中）→ completed（已完成，库容已扣减）。
+    → executing（执行配水中）→ completed（已完成，库容已扣减）
+    → adjust（滚动调整）→ reviewed → executing → completed（多轮）。
     """
     __tablename__ = "water_supply_plans"
 
@@ -423,7 +427,8 @@ class WaterSupplyPlan(Base):
     reason = Column(String(200), default="")          # 枯水期供水事由
     period_days = Column(Integer, default=1)          # 计划供水周期（日）
     status = Column(String(16), default="submitted")  # submitted/reviewed/executing/completed
-    plan_snapshot = Column(JSON, default=dict)        # 申报快照（申报时水库工况/总计划水量）
+    adjust_round = Column(Integer, default=1)         # 配水轮次：首次申报为 1，审核闭环后每滚动调整一轮 +1
+    plan_snapshot = Column(JSON, default=dict)        # 申报快照（申报时水库工况/总计划水量/历轮调整）
     completion_snapshot = Column(JSON, default=dict)  # 完成快照（实际供水/欠供/扣减后工况/预警联动）
     remark = Column(Text, default="")
 
@@ -481,6 +486,7 @@ class WaterSupplyEmergency(Base):
     township_id = Column(Integer, nullable=True)      # 空 = 供水单公用应急物资
     shortage_m3 = Column(Float, default=0.0)          # 追加时认定的欠供水量 m³
     quantity = Column(Integer, default=0)             # 追加数量（物资单位）
+    round = Column(Integer, default=1)                # 所属配水轮次（滚动调整轮次留痕）
     disposal_id = Column(Integer, nullable=True)      # 挂接原有防汛处置单（兼容）
     note = Column(String(200), default="")
     created_by = Column(String(64), default="")       # 追加：物资管理员

@@ -1,6 +1,6 @@
 """存量库迁移：枯水期供水保障。
 
-在防汛处置与应急资源协同基础上再做四件事（脚本幂等，可重复执行）：
+在防汛处置与应急资源协同基础上再做五件事（脚本幂等，可重复执行）：
 
 1. 建立供水保障表 townships / water_supply_plans / water_supply_allocations /
    water_supply_emergencies / reservoir_dispatch_logs
@@ -9,7 +9,9 @@
    （历史水库保持 0.0，服务层按正常蓄水位/死水位推算，不影响既有防洪演算）；
 3. warning_records 增加 water_supply_plan_id 关联列
    （历史预警保持 NULL，原样展示，不参与既有唯一约束）；
-4. 乡镇台账为空时补入演示受水乡镇（已有数据则跳过）。
+4. 乡镇台账为空时补入演示受水乡镇（已有数据则跳过）；
+5. 配水滚动调整列：water_supply_plans.adjust_round（配水轮次，历史单按 1）、
+   water_supply_emergencies.round（应急出库所属轮次，历史记录按 1）。
 
 用法：python scripts/migrate_water_supply.py
 """
@@ -63,27 +65,38 @@ def _seed_demo_townships():
 def main():
     # 1. 补建供水保障相关表（新表，不影响存量数据）
     Base.metadata.create_all(bind=engine)
-    print("[1/4] 枯水期供水保障相关表已就绪")
+    print("[1/5] 枯水期供水保障相关表已就绪")
 
     with engine.begin() as conn:
-        print("[2/4] 补充水库枯水水位列（历史水库保持 0.0，按曲线推算）...")
+        print("[2/5] 补充水库枯水水位列（历史水库保持 0.0，按曲线推算）...")
         _add_column_if_missing(conn, "reservoirs", "dead_level",
                                "dead_level FLOAT DEFAULT 0.0")
         _add_column_if_missing(conn, "reservoirs", "drought_warn_level",
                                "drought_warn_level FLOAT DEFAULT 0.0")
 
-        print("[3/4] 补充预警台账供水保障关联列（历史预警保持 NULL）...")
+        print("[3/5] 补充预警台账供水保障关联列（历史预警保持 NULL）...")
         _add_column_if_missing(conn, "warning_records", "water_supply_plan_id",
                                "water_supply_plan_id INTEGER")
 
-        print("[4/4] 配水明细唯一索引（同一单同一乡镇至多一条）...")
+        print("[4/5] 配水滚动调整轮次列（历史单/历史应急记录按首轮）...")
+        _add_column_if_missing(conn, "water_supply_plans", "adjust_round",
+                               "adjust_round INTEGER DEFAULT 1")
+        _add_column_if_missing(conn, "water_supply_emergencies", "round",
+                               "round INTEGER DEFAULT 1")
+        conn.execute(text("UPDATE water_supply_plans SET adjust_round = 1 "
+                          "WHERE adjust_round IS NULL OR adjust_round < 1"))
+        conn.execute(text("UPDATE water_supply_emergencies SET round = 1 "
+                          "WHERE round IS NULL OR round < 1"))
+
+        print("[5/5] 配水明细唯一索引（同一单同一乡镇至多一条）...")
         conn.execute(text(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_water_supply_alloc "
             "ON water_supply_allocations (plan_id, township_id)"))
         print("  + uq_water_supply_alloc")
 
     _seed_demo_townships()
-    print("迁移完成：枯水期供水保障（申请/审核/优先级/执行/完成扣减库容/应急物资）已启用。")
+    print("迁移完成：枯水期供水保障（申请/审核/优先级/执行/完成扣减库容/应急物资/"
+          "审核后滚动调整配水）已启用。")
 
 
 if __name__ == "__main__":

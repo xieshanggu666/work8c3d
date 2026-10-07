@@ -145,6 +145,17 @@ class WaterSupplyCompleteBody(BaseModel):
     summary: str = ""
 
 
+class WaterSupplyAdjustBody(BaseModel):
+    """审核闭环后滚动调整配水（轮次 +1，保留已供水与应急出库记录）。"""
+    period_days: int = 1
+    title: str = ""
+    reason: str = ""
+    remark: str = ""
+    allocations: list[WaterSupplyAllocationItem]
+    operator: str = ""
+    role: str = "manager"              # manager 水库管理员滚动调整配水
+
+
 @router.get("/overview")
 def overview(db: Session = Depends(get_db)):
     res = db.query(Reservoir).all()
@@ -154,7 +165,7 @@ def overview(db: Session = Depends(get_db)):
     zones = db.query(FloodZone).all()
     drought_res = sum(1 for r in res if ws_svc.drought_level(r))
     active_ws = db.query(WaterSupplyPlan).filter(
-        WaterSupplyPlan.status.in_(("submitted", "reviewed", "executing"))).count()
+        WaterSupplyPlan.status.in_(ws_svc.ACTIVE_STATUSES)).count()
     return {
         "basin_name": "青岚江流域",
         "sub_basins": len(subs),
@@ -468,3 +479,12 @@ def water_supply_complete(plan_id: int, body: WaterSupplyCompleteBody,
                           db: Session = Depends(get_db)):
     """乡镇完成：扣减库容、回写水库调度记录、升级/核销枯水预警。"""
     return ws_svc.complete_plan(db, plan_id, body.operator, body.role, body.summary)
+
+
+@router.post("/water-supply/{plan_id}/adjust")
+def water_supply_adjust(plan_id: int, body: WaterSupplyAdjustBody,
+                        db: Session = Depends(get_db)):
+    """水库管理员对已闭环保障单滚动调整配水（保留已供水/应急出库，重走审核与执行）。"""
+    data = body.model_dump()
+    data["plan_id"] = plan_id
+    return ws_svc.adjust_plan(db, data)

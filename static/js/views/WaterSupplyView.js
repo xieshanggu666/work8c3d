@@ -27,6 +27,11 @@ window.WaterSupplyView = {
       emgOpen: false,
       emgForm: { supply_id: null, quantity: 1, township_id: null, disposal_id: null, note: "" },
       emgBusy: false,
+      // 滚动调整弹窗（审核闭环后调整配水）
+      adjustOpen: false,
+      adjustBusy: false,
+      adjustForm: { period_days: 7, title: "", reason: "", remark: "",
+                    items: [] },
     };
   },
   computed: {
@@ -62,6 +67,13 @@ window.WaterSupplyView = {
     },
     totalShortage() {
       return this.current ? this.current.total_shortage_m3 : 0;
+    },
+    // 历轮滚动调整 / 结算历史
+    adjustHistory() {
+      return (this.current && this.current.plan && this.current.plan.adjust_history) || [];
+    },
+    roundHistory() {
+      return (this.current && this.current.completion && this.current.completion.rounds) || [];
     },
   },
   methods: {
@@ -248,14 +260,88 @@ window.WaterSupplyView = {
           summary: this.actionNote.trim(),
         });
         const c = p.completion || {};
-        window.app.showToast(
-          `已完成：放水 ${c.released_m3} m³、扣减库容，欠供 ${c.shortage_total_m3} m³`
-          + (c.drought_level_after ? `（${this.droughtText(c.drought_level_after)}）` : "（预警销警）"));
+        if (c.idempotent) {
+          window.app.showToast(
+            `重复提交：本轮无新增供水，未重复扣减库容（累计已结算 ${this.fmt.num(c.released_total_m3,0)} m³）`);
+        } else {
+          window.app.showToast(
+            `第${c.round || 1}轮已完成：本轮放水 ${this.fmt.num(c.released_m3,0)} m³、扣减库容，`
+            + `欠供 ${this.fmt.num(c.shortage_total_m3,0)} m³`
+            + (c.drought_level_after ? `（${this.droughtText(c.drought_level_after)}）` : "（预警销警）"));
+        }
         this.actionNote = "";
         await this.load();
         this.selectPlan(p);
       } catch (e) { window.app.showToast("完成失败：" + e.message); }
     },
+
+    // ---------------- 审核闭环后滚动调整配水 ----------------
+    canAdjust() {
+      return this.current && this.current.status === "completed" && this.role === "manager";
+    },
+    openAdjust() {
+      const p = this.current;
+      this.adjustForm = {
+        period_days: p.period_days,
+        title: p.title, reason: p.reason || "", remark: "",
+        // 以「当前计划水量」为初始值；已供水行作为不可移除的身份保留条目
+        items: p.allocations.map(a => ({
+          township_id: a.township_id,
+          planned_m3: a.planned_m3,
+          delivered_m3: a.delivered_m3 != null ? a.delivered_m3 : 0,
+        })),
+      };
+      this.adjustOpen = true;
+    },
+    addAdjustItem() {
+      const used = new Set(this.adjustForm.items.map(i => i.township_id));
+      const next = this.townships.find(t => !used.has(t.id));
+      this.adjustForm.items.push({ township_id: next ? next.id : null,
+                                   planned_m3: null, delivered_m3: 0 });
+    },
+    removeAdjustItem(idx) {
+      const it = this.adjustForm.items[idx];
+      if (it && it.delivered_m3 > 0) {
+        window.app.showToast("该乡镇已有供水记录，滚动调整不得移除（可核增其计划水量）");
+        return;
+      }
+      this.adjustForm.items.splice(idx, 1);
+    },
+    adjustTotal() {
+      return this.adjustForm.items.reduce((s, i) => s + (Number(i.planned_m3) || 0), 0);
+    },
+    async submitAdjust() {
+      const f = this.adjustForm;
+      if (!(f.period_days > 0)) { window.app.showToast("供水周期须大于 0"); return; }
+      const items = [];
+      const seen = new Set();
+      for (const it of f.items) {
+        if (!it.township_id) { window.app.showToast("请为每条配水选择乡镇"); return; }
+        if (seen.has(Number(it.township_id))) { window.app.showToast("同一乡镇重复，请合并"); return; }
+        seen.add(Number(it.township_id));
+        if (!(Number(it.planned_m3) > 0)) { window.app.showToast("配水量须大于 0"); return; }
+        if (Number(it.planned_m3) < Number(it.delivered_m3 || 0) - 1e-6) {
+          const t = this.townships.find(x => x.id === Number(it.township_id));
+          window.app.showToast(`「${t ? t.name : ''}」新计划水量不得低于累计已供水 ${it.delivered_m3} m³`);
+          return;
+        }
+        items.push({ township_id: Number(it.township_id), planned_m3: Number(it.planned_m3) });
+      }
+      this.adjustBusy = true;
+      try {
+        const p = await API.adjustWaterSupply(this.current.id, {
+          period_days: Number(f.period_days), title: f.title, reason: f.reason,
+          remark: f.remark, allocations: items,
+          operator: this.operatorNames.manager, role: "manager",
+        });
+        window.app.showToast(`已发起第 ${p.adjust_round} 轮滚动配水调整，待调度员重新审核（已供水/应急出库记录保留）`);
+        this.adjustOpen = false;
+        await this.load();
+        this.selectPlan(p);
+      } catch (e) { window.app.showToast("滚动调整失败：" + e.message); }
+      finally { this.adjustBusy = false; }
+    },
+    roundBadge(n) { return n > 1 ? `第 ${n} 轮` : ""; },
 
     // ---------------- 异常欠供应急物资 ----------------
     canEmergency() {
@@ -382,12 +468,13 @@ window.WaterSupplyView = {
         <div class="panel-head">供水保障单台账 <span class="tag">{{ plans.length }} 张</span></div>
         <div class="panel-body nopad">
           <table class="grid">
-            <thead><tr><th>单号</th><th>标题</th><th>水库</th><th>周期</th><th>计划/实供/欠供 (m³)</th><th>状态</th><th>应急追加</th><th>申报时间</th><th></th></tr></thead>
+            <thead><tr><th>单号</th><th>标题</th><th>水库</th><th>轮次</th><th>周期</th><th>计划/实供/欠供 (m³)</th><th>状态</th><th>应急追加</th><th>申报时间</th><th></th></tr></thead>
             <tbody>
               <tr v-for="p in plans" :key="p.id" style="cursor:pointer" @click="selectPlan(p)">
                 <td class="mono">#{{ p.id }}</td>
                 <td>{{ p.title }}</td>
                 <td>{{ p.reservoir_name }}</td>
+                <td><span v-if="p.adjust_round>1" class="badge cyan">第 {{ p.adjust_round }} 轮</span><span v-else class="badge gray">首轮</span></td>
                 <td class="num">{{ p.period_days }} 日</td>
                 <td class="num mono">
                   {{ fmt.num(p.total_planned_m3,0) }} /
@@ -435,6 +522,7 @@ window.WaterSupplyView = {
             <button class="btn sm" @click="backToList">← 返回</button>
             <div style="font-size:16px;font-weight:700">供水保障单 #{{ current.id }} · {{ current.title }}</div>
             <span class="badge" :class="statusBadge(current.status)">{{ current.status_text }}</span>
+            <span v-if="current.adjust_round>1" class="badge cyan">第 {{ current.adjust_round }} 轮滚动配水</span>
             <span v-if="current.total_shortage_m3 > 0" class="badge orange">欠供 {{ fmt.num(current.total_shortage_m3,0) }} m³</span>
             <span style="margin-left:auto;font-size:12px;color:#7d95b4">
               {{ current.reservoir_name }} · 计划周期 {{ current.period_days }} 日
@@ -473,10 +561,13 @@ window.WaterSupplyView = {
               ▶ 全部优先级已确认，启动配水
             </button>
             <button v-if="canComplete()" class="btn primary" @click="complete">
-              ✔ 完成配水并扣减库容、回写调度预警
+              ✔ 完成第{{ current.adjust_round }}轮配水并扣减库容、回写调度预警
             </button>
-            <span v-if="current.status==='completed'" class="badge green">保障已闭环</span>
-            <span v-else-if="!canReview() && !canConfirmPriorities() && !canComplete()"
+            <button v-if="canAdjust()" class="btn primary" @click="openAdjust">
+              ↻ 审核后滚动调整配水（保留已供水/应急出库）
+            </button>
+            <span v-if="current.status==='completed' && !canAdjust()" class="badge green">保障已闭环</span>
+            <span v-else-if="!canReview() && !canConfirmPriorities() && !canComplete() && !canAdjust()"
                   style="font-size:12.5px;color:#7d95b4">
               当前角色（{{ roleText[role] }}）本环节无待办，可切换角色继续流转
             </span>
@@ -487,11 +578,12 @@ window.WaterSupplyView = {
       <!-- 水量总览 -->
       <div class="stats">
         <div class="stat blue"><div class="k">计划总供水</div><div class="v">{{ fmt.num(current.total_planned_m3,0) }}<small>m³</small></div></div>
-        <div class="stat green"><div class="k">实际已供水</div><div class="v">{{ fmt.num(current.total_delivered_m3,0) }}<small>m³</small></div></div>
+        <div class="stat green"><div class="k">实际已供水（累计）</div><div class="v">{{ fmt.num(current.total_delivered_m3,0) }}<small>m³</small></div></div>
         <div class="stat" :class="current.total_shortage_m3>0 ? 'red' : ''">
           <div class="k">欠供水量</div><div class="v">{{ fmt.num(current.total_shortage_m3,0) }}<small>m³</small></div>
         </div>
         <div class="stat amber"><div class="k">应急物资追加</div><div class="v">{{ current.emergencies.length }}<small>次</small></div></div>
+        <div class="stat cyan"><div class="k">本轮待扣库容增量</div><div class="v">{{ fmt.num(current.round_released_m3,0) }}<small>m³</small></div></div>
         <div class="stat" v-if="planReservoir">
           <div class="k">死水位以上尚可放</div>
           <div class="v">{{ fmt.num(planReservoir.available_water_m3,0) }}<small>m³</small></div>
@@ -536,9 +628,10 @@ window.WaterSupplyView = {
                   <div v-else-if="canSetPriority() && a.priority_confirmed" style="font-size:11.5px;color:#7dd3a0">
                     ✓ 已确认第 {{ a.priority }} 顺位
                   </div>
-                  <!-- 乡镇执行上报 -->
+                  <!-- 乡镇执行上报（滚动轮次按累计实供口径，默认带出当前值） -->
                   <div v-if="canReport()" style="display:flex;gap:6px;align-items:center;margin-top:4px">
-                    <input type="number" min="0" :max="a.planned_m3" v-model.number="deliveryInputs[a.id]" style="width:110px"/>
+                    <input type="number" min="0" :max="a.planned_m3" v-model.number="deliveryInputs[a.id]" style="width:110px"
+                           :title="current.adjust_round>1 ? '滚动轮次按累计实供口径上报' : '实际上报供水量'"/>
                     <button class="btn xs primary" @click="reportDelivery(a)">上报实供</button>
                   </div>
                   <!-- 欠供应急 -->
@@ -565,10 +658,11 @@ window.WaterSupplyView = {
                 <span v-else style="font-size:12px;color:#7d95b4">执行配水出现欠供后，由物资管理员在此追加应急物资</span>
               </div>
               <table class="grid">
-                <thead><tr><th>时间</th><th>物资</th><th>数量</th><th>投向乡镇</th><th>认定欠供(m³)</th><th>挂接处置单</th><th>说明</th><th>操作人</th></tr></thead>
+                <thead><tr><th>时间</th><th>轮次</th><th>物资</th><th>数量</th><th>投向乡镇</th><th>认定欠供(m³)</th><th>挂接处置单</th><th>说明</th><th>操作人</th></tr></thead>
                 <tbody>
                   <tr v-for="e in current.emergencies" :key="e.id">
                     <td style="font-size:11.5px;color:#7d95b4">{{ fmt.time(e.created_at) }}</td>
+                    <td><span :class="e.round>1 ? 'badge cyan' : 'badge gray'">{{ e.round>1 ? '第'+e.round+'轮' : '首轮' }}</span></td>
                     <td>{{ e.supply_name }}</td>
                     <td class="num">{{ e.quantity }} {{ e.unit }}</td>
                     <td>{{ e.township_id ? emgTownName(e.township_id) : '整单公用' }}</td>
@@ -582,7 +676,7 @@ window.WaterSupplyView = {
                     <td style="font-size:11.5px;color:#7d95b4">{{ e.created_by }}</td>
                   </tr>
                   <tr v-if="!current.emergencies.length">
-                    <td colspan="8" style="text-align:center;color:#7d95b4;padding:18px">暂无应急物资追加记录</td>
+                    <td colspan="9" style="text-align:center;color:#7d95b4;padding:18px">暂无应急物资追加记录</td>
                   </tr>
                 </tbody>
               </table>
@@ -642,18 +736,49 @@ window.WaterSupplyView = {
         </div>
         <div class="col col-1" v-if="current.completion">
           <div class="panel">
-            <div class="panel-head">完成结算 <span class="tag">扣减库容回写</span></div>
+            <div class="panel-head">{{ roundBadge(current.completion.round || 1) ? roundBadge(current.completion.round) + ' ' : '' }}完成结算
+              <span class="tag">{{ current.completion.idempotent ? '零增量·未重复扣库容' : '增量扣减库容回写' }}</span>
+            </div>
             <div class="panel-body" style="font-size:13px;line-height:2">
-              <div>实际放水：<b style="color:#7dd3a0">{{ fmt.num(current.completion.released_m3,0) }}</b> m³
-                ｜欠供：<b :style="current.completion.shortage_total_m3>0 ? 'color:#ff8d97' : ''">{{ fmt.num(current.completion.shortage_total_m3,0) }}</b> m³</div>
+              <div>本轮放水：<b style="color:#7dd3a0">{{ fmt.num(current.completion.released_m3,0) }}</b> m³
+                ｜累计实供：<b>{{ fmt.num(current.completion.cumulative_delivered_m3,0) }}</b> m³</div>
+              <div>欠供：<b :style="current.completion.shortage_total_m3>0 ? 'color:#ff8d97' : ''">{{ fmt.num(current.completion.shortage_total_m3,0) }}</b> m³
+                ｜已结算累计：{{ fmt.num(current.completion.released_total_m3,0) }} m³</div>
               <div>库容：{{ fmt.num(current.completion.storage_before,1) }} →
                 <b>{{ fmt.num(current.completion.storage_after,1) }}</b> 万m³</div>
               <div>水位：{{ fmt.num(current.completion.level_before,2) }} →
                 <b>{{ fmt.num(current.completion.level_after,2) }}</b> m</div>
-              <div>应急物资追加：{{ current.completion.emergency_count }} 次
-                ｜调度记录 #{{ current.completion.dispatch_log_id }}</div>
+              <div>应急物资追加：本轮 {{ current.completion.emergency_count }} 次
+                （累计 {{ current.completion.emergency_cumulative }} 次）
+                ｜调度记录 <template v-if="current.completion.dispatch_log_id">#{{ current.completion.dispatch_log_id }}</template><template v-else>无（零增量）</template></div>
             </div>
           </div>
+        </div>
+      </div>
+
+      <!-- 历轮滚动调整 / 结算历史 -->
+      <div class="panel" v-if="adjustHistory.length || roundHistory.length">
+        <div class="panel-head">滚动配水轮次台账 <span class="tag">审核闭环后滚动调整 · 已供水与应急出库逐轮保留</span></div>
+        <div class="panel-body nopad">
+          <table class="grid">
+            <thead>
+              <tr><th>轮次</th><th>结算时间</th><th>周期(日)</th><th>计划(m³)</th><th>本轮放水(m³)</th><th>累计实供(m³)</th><th>欠供(m³)</th><th>放水后水位(m)</th><th>放水后库容(万m³)</th><th>调度记录</th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="(h, i) in roundHistory" :key="'h'+i" style="font-size:12.5px">
+                <td><span class="badge gray">第 {{ h.round }} 轮</span></td>
+                <td style="color:#7d95b4">{{ fmt.time(h.at) }}</td>
+                <td class="num">{{ h.period_days }}</td>
+                <td class="num mono">{{ fmt.num(h.planned_total_m3,0) }}</td>
+                <td class="num mono">{{ fmt.num(h.released_m3,0) }}</td>
+                <td class="num mono">{{ fmt.num(h.cumulative_delivered_m3,0) }}</td>
+                <td class="num mono" :style="h.shortage_total_m3>0 ? 'color:#ff8d97' : ''">{{ fmt.num(h.shortage_total_m3,0) }}</td>
+                <td class="num mono">{{ fmt.num(h.level_after,2) }}</td>
+                <td class="num mono">{{ fmt.num(h.storage_after,1) }}</td>
+                <td><span v-if="h.dispatch_log_id" class="badge blue">#{{ h.dispatch_log_id }}</span><span v-else class="badge gray">零增量</span></td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       </div>
     </template>
@@ -779,6 +904,78 @@ window.WaterSupplyView = {
           <button class="btn" @click="emgOpen=false">取消</button>
           <button class="btn primary" :disabled="emgBusy" @click="submitEmergency">
             {{ emgBusy ? "出库中…" : "确认追加并直接出库" }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 滚动调整配水弹窗 -->
+    <div v-if="adjustOpen" class="modal-mask" @click.self="adjustOpen=false">
+      <div class="modal">
+        <div class="modal-head">
+          滚动调整分乡镇配水（第 {{ (current ? current.adjust_round : 1) + 1 }} 轮）
+          <button class="modal-close" @click="adjustOpen=false">×</button>
+        </div>
+        <div class="modal-body">
+          <p style="font-size:12.5px;color:#b9cbe2;line-height:1.9;margin:0 0 12px">
+            审核闭环后滚动调整：<b style="color:#7dd3a0">保留各乡累计已供水与应急物资出库记录</b>、
+            重新校验死水位可供水；原有乡镇条目不可移除且新计划水量不得低于累计已供水，
+            可核增计划水量并追加新乡镇；提交后调度员重新审核、乡镇重新确认优先级后执行。
+            本轮完成时<b style="color:#7dd3a0">只扣「累计实供 − 已结算」增量</b>，重复完成不重复扣库容。
+          </p>
+          <div style="display:flex;gap:10px">
+            <div class="field" style="flex:1">
+              <label>计划供水周期（日）</label>
+              <input type="number" min="1" v-model.number="adjustForm.period_days"/>
+            </div>
+            <div class="field" style="flex:2">
+              <label>计划标题（可选）</label>
+              <input v-model="adjustForm.title" :placeholder="current ? current.title : ''"/>
+            </div>
+          </div>
+          <div class="field">
+            <label>枯水事由更新（可选）</label>
+            <input v-model="adjustForm.reason" placeholder="如：旱情持续，延长供水周期并增补下游乡镇"/>
+          </div>
+          <div class="field">
+            <label>新一轮分乡镇配水计划（m³，累计口径）</label>
+            <table class="grid">
+              <thead><tr><th>受水乡镇</th><th>累计已供水</th><th>新一轮计划配水量</th><th></th></tr></thead>
+              <tbody>
+                <tr v-for="(it, idx) in adjustForm.items" :key="idx">
+                  <td>
+                    <select v-model.number="it.township_id" :disabled="it.delivered_m3>0">
+                      <option v-for="t in townships" :key="t.id" :value="t.id">{{ t.name }}</option>
+                    </select>
+                  </td>
+                  <td class="num mono" style="color:#7dd3a0">{{ fmt.num(it.delivered_m3,0) }}</td>
+                  <td><input type="number" min="0" v-model.number="it.planned_m3" style="width:140px"/></td>
+                  <td style="text-align:right">
+                    <button class="btn xs danger" @click="removeAdjustItem(idx)">删除</button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <button class="btn sm" style="margin-top:8px" @click="addAdjustItem">＋ 增加乡镇</button>
+            <div style="margin-top:10px;font-size:13px" v-if="current">
+              新一轮计划合计：<b :style="adjustTotal()-current.released_total_m3>(planReservoir?planReservoir.available_water_m3:0) ? 'color:#ff6b7a' : 'color:#7dd3a0'">
+                {{ fmt.num(adjustTotal(),0) }} m³</b>
+              <span style="color:#7d95b4">
+                ｜历轮已结算 {{ fmt.num(current.released_total_m3,0) }} m³
+                ｜本轮尚需放水 {{ fmt.num(Math.max(adjustTotal()-current.released_total_m3,0),0) }} m³
+                ｜死水位以上可供水 {{ fmt.num(planReservoir ? planReservoir.available_water_m3 : 0,0) }} m³
+              </span>
+            </div>
+          </div>
+          <div class="field">
+            <label>调整说明（可选）</label>
+            <input v-model="adjustForm.remark" placeholder="如：旱情持续，核增青源乡配水并追加龙潭镇"/>
+          </div>
+        </div>
+        <div class="modal-foot">
+          <button class="btn" @click="adjustOpen=false">取消</button>
+          <button class="btn primary" :disabled="adjustBusy" @click="submitAdjust">
+            {{ adjustBusy ? "提交中…" : "提交滚动调整，转调度员审核" }}
           </button>
         </div>
       </div>
