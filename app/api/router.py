@@ -109,6 +109,14 @@ class WaterSupplyReviewBody(BaseModel):
     opinion: str = ""
 
 
+class WaterSupplyAdjustBody(BaseModel):
+    allocations: list[WaterSupplyAllocationItem]  # 调整后的完整配水方案
+    period_days: int = 0               # 0 = 沿用原周期
+    reason: str = ""                   # 调整事由
+    operator: str = ""
+    role: str = "manager"              # manager 水库管理员 / dispatcher 调度员
+
+
 class WaterSupplyPriorityBody(BaseModel):
     township_id: int
     priority: int                      # 1 最高
@@ -431,6 +439,16 @@ def water_supply_review(plan_id: int, body: WaterSupplyReviewBody,
                         db: Session = Depends(get_db)):
     """调度员审核：复核可放水量并登记枯水/供水预警。"""
     return ws_svc.review_plan(db, plan_id, body.operator, body.role, body.opinion)
+
+
+@router.post("/water-supply/{plan_id}/adjust")
+def water_supply_adjust(plan_id: int, body: WaterSupplyAdjustBody,
+                        db: Session = Depends(get_db)):
+    """审核后滚动调整配水方案：保留已供水与应急出库记录，重校死水位/优先级/预警。
+
+    调整内容与现行方案一致时幂等归并；库容仍仅在完成环节扣减一次。
+    """
+    return ws_svc.adjust_plan(db, plan_id, body.model_dump())
 
 
 @router.post("/water-supply/{plan_id}/priority")

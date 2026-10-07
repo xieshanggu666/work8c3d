@@ -27,6 +27,10 @@ window.WaterSupplyView = {
       emgOpen: false,
       emgForm: { supply_id: null, quantity: 1, township_id: null, disposal_id: null, note: "" },
       emgBusy: false,
+      // 滚动调整弹窗
+      adjOpen: false,
+      adjForm: { period_days: 7, reason: "", items: [] },
+      adjBusy: false,
     };
   },
   computed: {
@@ -181,9 +185,77 @@ window.WaterSupplyView = {
       } catch (e) { window.app.showToast("审核失败：" + e.message); }
     },
 
+    // ---------------- 审核后滚动调整配水 ----------------
+    canAdjust() {
+      return this.current && ["reviewed", "executing"].includes(this.current.status)
+        && ["manager", "dispatcher"].includes(this.role);
+    },
+    openAdjust() {
+      const c = this.current;
+      this.adjForm = {
+        period_days: c.period_days,
+        reason: "",
+        items: c.allocations.map(a => ({
+          township_id: a.township_id, planned_m3: a.planned_m3,
+          delivered_m3: a.delivered_m3, township_name: a.township_name,
+        })),
+      };
+      this.adjOpen = true;
+    },
+    adjAddItem() {
+      const used = new Set(this.adjForm.items.map(i => i.township_id));
+      const next = this.townships.find(t => !used.has(t.id));
+      this.adjForm.items.push({ township_id: next ? next.id : null, planned_m3: null,
+                                delivered_m3: null, township_name: "" });
+    },
+    adjRemoveItem(idx) {
+      if (this.adjForm.items.length > 1) this.adjForm.items.splice(idx, 1);
+    },
+    adjTotal() {
+      return this.adjForm.items.reduce((s, i) => s + (Number(i.planned_m3) || 0), 0);
+    },
+    adjTownName(tid) {
+      const t = this.townships.find(x => x.id === Number(tid));
+      return t ? t.name : "";
+    },
+    async submitAdjust() {
+      const f = this.adjForm;
+      if (!(f.period_days > 0)) { window.app.showToast("供水周期须大于 0"); return; }
+      const items = [];
+      const seen = new Set();
+      for (const it of f.items) {
+        if (!it.township_id) { window.app.showToast("请为每条配水选择乡镇"); return; }
+        if (seen.has(Number(it.township_id))) { window.app.showToast("同一乡镇重复，请合并"); return; }
+        seen.add(Number(it.township_id));
+        if (!(Number(it.planned_m3) > 0)) { window.app.showToast("配水量须大于 0"); return; }
+        if (it.delivered_m3 != null && Number(it.planned_m3) < it.delivered_m3) {
+          window.app.showToast(`「${this.adjTownName(it.township_id)}」已实供 ${it.delivered_m3} m³，计划量不得低于已供水量`);
+          return;
+        }
+        items.push({ township_id: Number(it.township_id), planned_m3: Number(it.planned_m3) });
+      }
+      this.adjBusy = true;
+      try {
+        const p = await API.adjustWaterSupply(this.current.id, {
+          allocations: items, period_days: Number(f.period_days),
+          reason: f.reason.trim(), operator: this.operatorNames[this.role],
+          role: this.role,
+        });
+        window.app.showToast(p.adjust_round > (this.current.adjust_round || 0)
+          ? `已滚动调整（第 ${p.adjust_round} 轮）：重校死水位/优先级/预警，已供水与应急出库记录保留`
+          : "调整方案与现行方案一致，已幂等归并");
+        this.adjOpen = false;
+        await this.load();
+        this.selectPlan(p);
+      } catch (e) { window.app.showToast("滚动调整失败：" + e.message); }
+      finally { this.adjBusy = false; }
+    },
+
     // ---------------- 乡镇确认优先级 ----------------
     canSetPriority() {
-      return this.current && this.current.status === "reviewed" && this.role === "township";
+      // reviewed 逐户确认；executing 滚动调整后新增/调量乡镇补确认
+      return this.current && ["reviewed", "executing"].includes(this.current.status)
+        && this.role === "township";
     },
     canConfirmPriorities() {
       // reviewed 状态下乡镇可启动；按钮内部再按确认情况禁用/放开
@@ -435,6 +507,8 @@ window.WaterSupplyView = {
             <button class="btn sm" @click="backToList">← 返回</button>
             <div style="font-size:16px;font-weight:700">供水保障单 #{{ current.id }} · {{ current.title }}</div>
             <span class="badge" :class="statusBadge(current.status)">{{ current.status_text }}</span>
+            <span v-if="current.adjust_round > 0" class="badge cyan"
+                  :title="current.last_adjust ? '最近调整：' + current.last_adjust.by : ''">已滚动调整 {{ current.adjust_round }} 轮</span>
             <span v-if="current.total_shortage_m3 > 0" class="badge orange">欠供 {{ fmt.num(current.total_shortage_m3,0) }} m³</span>
             <span style="margin-left:auto;font-size:12px;color:#7d95b4">
               {{ current.reservoir_name }} · 计划周期 {{ current.period_days }} 日
@@ -468,6 +542,10 @@ window.WaterSupplyView = {
               <input v-model="actionNote" :placeholder="canReview() ? '如：同意按计划供水，加强旱情监测' : '记录说明…'"/>
             </div>
             <button v-if="canReview()" class="btn primary" @click="review">✓ 审核通过并登记供水预警</button>
+            <button v-if="canAdjust()" class="btn" @click="openAdjust"
+                    title="审核后滚动调整配水方案：保留已供水与应急出库记录，重校死水位/优先级/预警">
+              ⟳ 滚动调整配水
+            </button>
             <button v-if="canConfirmPriorities()" class="btn primary"
                     :disabled="!current.all_priority_confirmed" @click="confirmPriorities">
               ▶ 全部优先级已确认，启动配水
@@ -536,10 +614,13 @@ window.WaterSupplyView = {
                   <div v-else-if="canSetPriority() && a.priority_confirmed" style="font-size:11.5px;color:#7dd3a0">
                     ✓ 已确认第 {{ a.priority }} 顺位
                   </div>
-                  <!-- 乡镇执行上报 -->
-                  <div v-if="canReport()" style="display:flex;gap:6px;align-items:center;margin-top:4px">
+                  <!-- 乡镇执行上报（滚动调整后须先重新确认优先级） -->
+                  <div v-if="canReport() && a.priority_confirmed" style="display:flex;gap:6px;align-items:center;margin-top:4px">
                     <input type="number" min="0" :max="a.planned_m3" v-model.number="deliveryInputs[a.id]" style="width:110px"/>
                     <button class="btn xs primary" @click="reportDelivery(a)">上报实供</button>
+                  </div>
+                  <div v-else-if="canReport() && !a.priority_confirmed" style="font-size:11.5px;color:#ffb84d;margin-top:4px">
+                    滚动调整后待乡镇重新确认优先级，确认后可上报实供
                   </div>
                   <!-- 欠供应急 -->
                   <button v-if="(a.shortage_m3||0)>0 && role==='supply_manager' && ['executing','completed'].includes(current.status)"
@@ -637,6 +718,19 @@ window.WaterSupplyView = {
                 ｜枯水预警线：{{ fmt.num(current.plan.reservoir.drought_warn_level,2) }} m</div>
               <div>申报可供水：{{ fmt.num(current.plan.available_water_m3,0) }} m³
                 ｜日均计划：{{ fmt.num(current.plan.daily_planned_m3,0) }} m³/日</div>
+              <div v-if="current.adjust_round > 0 && current.last_adjust" style="color:#7dd3a0">
+                已滚动调整 {{ current.adjust_round }} 轮：{{ current.last_adjust.by }}
+                <template v-if="current.last_adjust.added && current.last_adjust.added.length">
+                  新增 {{ current.last_adjust.added.join('、') }}；
+                </template>
+                <template v-if="current.last_adjust.changed && current.last_adjust.changed.length">
+                  调量 {{ current.last_adjust.changed.join('、') }}；
+                </template>
+                <template v-if="current.last_adjust.removed && current.last_adjust.removed.length">
+                  核减 {{ current.last_adjust.removed.join('、') }}；
+                </template>
+                已供水 {{ current.last_adjust.delivered_kept }} 个乡镇记录保留
+              </div>
             </div>
           </div>
         </div>
@@ -721,6 +815,76 @@ window.WaterSupplyView = {
         <div class="modal-foot">
           <button class="btn" @click="submitOpen=false">取消</button>
           <button class="btn primary" @click="submitForm">提交审核</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 滚动调整弹窗 -->
+    <div v-if="adjOpen" class="modal-mask" @click.self="adjOpen=false">
+      <div class="modal">
+        <div class="modal-head">
+          滚动调整配水方案（第 {{ (current ? current.adjust_round : 0) + 1 }} 轮）
+          <button class="modal-close" @click="adjOpen=false">×</button>
+        </div>
+        <div class="modal-body">
+          <p style="font-size:12.5px;color:#b9cbe2;line-height:1.9;margin:0 0 12px">
+            审核后可滚动调整配水：<b style="color:#7dd3a0">已供水上报与应急出库记录保留</b>；
+            重新校验死水位可用水量与乡镇优先级（新增/调量乡镇须重新确认），
+            供水预警按当前工况刷新。重复提交同一方案自动幂等归并，不会重复扣减库容。
+          </p>
+          <div style="display:flex;gap:10px">
+            <div class="field" style="flex:1">
+              <label>计划供水周期（日）</label>
+              <input type="number" min="1" v-model.number="adjForm.period_days"/>
+            </div>
+            <div class="field" style="flex:2">
+              <label>调整事由（可选）</label>
+              <input v-model="adjForm.reason" placeholder="如：旱情发展，核增受水乡镇"/>
+            </div>
+          </div>
+          <div class="field">
+            <label>分乡镇配水方案（m³）</label>
+            <table class="grid">
+              <thead><tr><th>受水乡镇</th><th>调整后计划配水量</th><th>已实供下限</th><th></th></tr></thead>
+              <tbody>
+                <tr v-for="(it, idx) in adjForm.items" :key="idx">
+                  <td>
+                    <select v-model.number="it.township_id">
+                      <option v-for="t in townships" :key="t.id" :value="t.id"
+                              :disabled="adjForm.items.some(x => x !== it && x.township_id === t.id)">
+                        {{ t.name }}（日均需水 {{ t.demand_m3 }} m³）
+                      </option>
+                    </select>
+                  </td>
+                  <td><input type="number" min="1" v-model.number="it.planned_m3" style="width:130px"/></td>
+                  <td class="num mono" style="font-size:12px">
+                    <span v-if="it.delivered_m3 != null" style="color:#ffb84d">已供 {{ fmt.num(it.delivered_m3,0) }}</span>
+                    <span v-else style="color:#7d95b4">未供水</span>
+                  </td>
+                  <td style="text-align:right">
+                    <button class="btn xs danger" @click="adjRemoveItem(idx)"
+                            :disabled="adjForm.items.length<=1 || it.delivered_m3 != null"
+                            :title="it.delivered_m3 != null ? '已供水乡镇须保留' : ''">删除</button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <button class="btn sm" style="margin-top:8px" @click="adjAddItem">＋ 增加乡镇</button>
+            <div style="margin-top:10px;font-size:13px">
+              调整后合计：<b>{{ fmt.num(adjTotal(),0) }} m³</b>
+              <span v-if="planReservoir" style="color:#7d95b4"
+                    :style="adjTotal() > planReservoir.available_water_m3 + (current ? current.total_planned_m3 : 0) ? 'color:#ff6b7a' : ''">
+                ｜本单调整上限 {{ fmt.num(planReservoir.available_water_m3 + (current ? current.total_planned_m3 : 0),0) }} m³
+                （死水位以上可供水 {{ fmt.num(planReservoir.available_water_m3,0) }} + 本单已预留 {{ fmt.num(current ? current.total_planned_m3 : 0,0) }}）
+              </span>
+            </div>
+          </div>
+        </div>
+        <div class="modal-foot">
+          <button class="btn" @click="adjOpen=false">取消</button>
+          <button class="btn primary" :disabled="adjBusy" @click="submitAdjust">
+            {{ adjBusy ? "调整中…" : "确认滚动调整" }}
+          </button>
         </div>
       </div>
     </div>

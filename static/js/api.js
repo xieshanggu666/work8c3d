@@ -62,6 +62,7 @@ const API = {
   waterSupplyPlan: (id) => API.get(`/api/water-supply/${id}`),
   submitWaterSupply: (body) => API.post("/api/water-supply", body),
   reviewWaterSupply: (id, body) => API.post(`/api/water-supply/${id}/review`, body),
+  adjustWaterSupply: (id, body) => API.post(`/api/water-supply/${id}/adjust`, body),
   setWaterPriority: (id, body) => API.post(`/api/water-supply/${id}/priority`, body),
   confirmWaterPriorities: (id, body) => API.post(`/api/water-supply/${id}/confirm-priorities`, body),
   reportWaterDelivery: (id, body) => API.post(`/api/water-supply/${id}/delivery`, body),

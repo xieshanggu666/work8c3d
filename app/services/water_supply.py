@@ -10,10 +10,21 @@
                                             回写水库调度记录与预警）
     物资管理员 supply_manager add_emergency → 异常欠供时追加应急物资（直接出库，
                                             可挂接原有防汛处置单，兼容处置记录）
+    水库管理员/调度员 adjust_plan         → 审核后（reviewed/executing）滚动调整
+                                            配水方案，快照按轮次演进
+
+滚动调整（审核后）
+    - 保留已供水上报（delivered_m3）与应急出库记录（WaterSupplyEmergency）：
+      已上报乡镇不得移除、计划量不得调低于已供水量；
+    - 重新校验：死水位可用水量（跨进行中单据预留、排除本单）、乡镇优先级
+      （新增/调量乡镇须重新确认，executing 中可补确认）、供水预警按当前工况
+      刷新（人工处置状态保留）、调整留痕处置记录；
+    - 幂等：调整内容与现行方案完全一致时归并返回（不增轮次、不写记录）；
+      库容仍仅在完成环节扣减一次，重复提交不会重复扣库容。
 
 约束
     - 同一水库至多一张未闭环供水保障单（submitted/reviewed/executing），闭环后可重新申报；
-    - 计划/审核按「当前库容 − 死水位库容」做可放水量校验，跨进行中单据统一预留；
+    - 计划/审核/滚动调整按「当前库容 − 死水位库容」做可放水量校验，跨进行中单据统一预留；
     - 完成时实际放水量不得突破死水位库容（突破 409，须按欠供上报而非超放）；
     - 应急物资复用 supplies 库存池出库，与防汛处置的物资占用串行（同物资锁）。
 
@@ -240,6 +251,8 @@ def serialize_plan(db: Session, plan: WaterSupplyPlan) -> dict:
         "total_shortage_m3": round(total_shortage, 1),
         "all_priority_confirmed": all(a.priority_confirmed for a in allocs) and bool(allocs),
         "warning_count": warnings,
+        "adjust_round": int((plan.plan_snapshot or {}).get("adjust_round", 0) or 0),
+        "last_adjust": (plan.plan_snapshot or {}).get("last_adjust"),
         "submitted_by": plan.submitted_by, "reviewed_by": plan.reviewed_by,
         "priority_by": plan.priority_by, "executed_by": plan.executed_by,
         "completed_by": plan.completed_by,
@@ -414,12 +427,166 @@ def _upsert_supply_warning(db: Session, plan: WaterSupplyPlan, res: Reservoir,
     return rec
 
 
+# ---------------- 2.5 审核后滚动调整配水 ----------------
+def adjust_plan(db: Session, plan_id: int, body: dict) -> dict:
+    """审核后滚动调整配水方案（reviewed/executing）。
+
+    保留已供水上报与应急出库记录；按调整后方案重新校验死水位可用水量、
+    乡镇优先级确认（新增/调量乡镇须重新确认）、按当前工况刷新供水预警，
+    并留痕处置记录。调整内容与现行方案完全一致时幂等归并（不新增轮次、
+    不写记录）；调整本身不扣库容，库容仍仅在完成环节扣减一次。
+    """
+    _require_role(body.get("role", ""), ("manager", "dispatcher"), "滚动调整配水")
+    plan = _get_plan(db, plan_id)
+    _require_status(plan, ("reviewed", "executing"), "滚动调整配水")
+
+    items = body.get("allocations") or []
+    clean = []
+    seen = set()
+    for it in items:
+        tid = int(it.get("township_id") or 0)
+        planned = float(it.get("planned_m3") or 0)
+        town = db.get(Township, tid)
+        if town is None or not town.active:
+            raise HTTPException(404, f"受水乡镇 #{tid} 不存在或已停用")
+        if planned <= 0:
+            raise HTTPException(422, f"乡镇「{town.name}」计划配水量须大于 0")
+        if tid in seen:
+            raise HTTPException(422, f"乡镇「{town.name}」重复出现，请合并为一条")
+        seen.add(tid)
+        clean.append((town, planned))
+    if not clean:
+        raise HTTPException(422, "调整后方案至少保留一个乡镇的配水量")
+
+    with _reservoir_lock(plan.reservoir_id):
+        db.refresh(plan)
+        _require_status(plan, ("reviewed", "executing"), "滚动调整配水")
+        res = db.get(Reservoir, plan.reservoir_id)
+        allocs = db.query(WaterSupplyAllocation).filter(
+            WaterSupplyAllocation.plan_id == plan.id).all()
+        cur_by_tid = {a.township_id: a for a in allocs}
+        period = int(body.get("period_days") or 0) or plan.period_days
+        if period <= 0:
+            raise HTTPException(422, "计划供水周期须大于 0（日）")
+
+        new_map = {t.id: p for t, p in clean}
+        # ---- 幂等归并：与现行方案完全一致 → 直接返回，不新增调整轮次 ----
+        same_alloc = (set(new_map) == set(cur_by_tid) and
+                      all(abs(cur_by_tid[t].planned_m3 - v) <= 1e-6
+                          for t, v in new_map.items()))
+        if period == plan.period_days and same_alloc:
+            return serialize_plan(db, plan)
+
+        operator = (body.get("operator") or "").strip() or (
+            "水库管理员" if body.get("role") == "manager" else "值班调度员")
+
+        # ---- 保留已供水：已上报乡镇不得移除、计划量不得低于已供水量 ----
+        for a in allocs:
+            if a.delivered_m3 is None:
+                continue
+            if a.township_id not in new_map:
+                raise HTTPException(
+                    409, f"乡镇「{a.township_name}」已上报实供 "
+                         f"{a.delivered_m3:.0f} m³，已供水记录须保留，"
+                         f"不能从配水方案中移除")
+            if new_map[a.township_id] < a.delivered_m3 - 1e-6:
+                raise HTTPException(
+                    409, f"乡镇「{a.township_name}」已实供 {a.delivered_m3:.0f} m³，"
+                         f"调整后计划量不得低于已供水量")
+
+        # ---- 死水位可用水量重校（跨进行中单据预留，排除本单）----
+        total = sum(new_map.values())
+        available = _available_water_m3(db, res, exclude_plan_id=plan.id)
+        if total > available:
+            raise HTTPException(
+                409, f"复核未通过：水库「{res.name}」死水位以上可用水量仅 "
+                     f"{available:.0f} m³，调整后计划供水 {total:.0f} m³ 超限，"
+                     f"请核减配水量")
+
+        # ---- 应用调整：新增/调量/核减，乡镇优先级确认状态重校 ----
+        old_total = sum(a.planned_m3 for a in allocs)
+        old_period = plan.period_days
+        added, changed, removed = [], [], []
+        for town, planned in clean:
+            cur = cur_by_tid.get(town.id)
+            if cur is None:
+                db.add(WaterSupplyAllocation(
+                    plan_id=plan.id, township_id=town.id, township_name=town.name,
+                    planned_m3=planned, created_by=operator))
+                added.append(town.name)
+            elif abs(cur.planned_m3 - planned) > 1e-6:
+                cur.planned_m3 = planned
+                cur.priority_confirmed = 0  # 计划量变化：乡镇须重新确认优先级
+                changed.append(town.name)
+        for a in allocs:
+            if a.township_id not in new_map:
+                db.delete(a)  # 已上报实供的乡镇上面已拦截，此处均为未供水条目
+                removed.append(a.township_name)
+        plan.period_days = period
+        db.flush()
+
+        # ---- 快照滚动（轮次历史，与防汛处置滚动方案同口径）----
+        allocs_new = db.query(WaterSupplyAllocation).filter(
+            WaterSupplyAllocation.plan_id == plan.id).all()
+        snapshot = _build_snapshot(db, res, plan, allocs_new)
+        prev = plan.plan_snapshot or {}
+        round_no = int(prev.get("adjust_round", 0) or 0) + 1
+        rounds = list(prev.get("rounds") or [])
+        reason = (body.get("reason") or "").strip()
+        rounds.append({
+            "round": round_no, "at": datetime.now().isoformat(), "by": operator,
+            "total_planned_m3": round(total, 1), "period_days": period,
+            "reason": reason,
+        })
+        snapshot["adjust_round"] = round_no
+        snapshot["rounds"] = rounds
+        snapshot["last_adjust"] = {
+            "at": datetime.now().isoformat(), "by": operator,
+            "added": added, "changed": changed, "removed": removed,
+            "delivered_kept": sum(1 for a in allocs if a.delivered_m3 is not None),
+            "reason": reason,
+        }
+        plan.plan_snapshot = snapshot
+
+        # ---- 预警重校：按当前工况刷新供水预警（人工处置状态保留）----
+        lv = drought_level(res)
+        if lv:
+            msg = (f"{res.name}当前水位{res.current_level:.2f}m（枯水预警线"
+                   f"{effective_drought_warn_level(res):.2f}m），枯水期供水保障"
+                   f"滚动调整至{total:.0f}m³/{period}日（第{round_no}轮）")
+            _upsert_supply_warning(
+                db, plan, res, lv, msg,
+                status="handling" if plan.status == "executing" else "active")
+
+        # ---- 留痕处置记录（调度台账备注流）----
+        parts = []
+        if added:
+            parts.append(f"新增{'、'.join(added)}")
+        if changed:
+            parts.append(f"调量{'、'.join(changed)}（需重新确认优先级）")
+        if removed:
+            parts.append(f"核减{'、'.join(removed)}")
+        line = (f"[滚动调整·第{round_no}轮] {operator} 调整配水方案：计划总量 "
+                f"{old_total:.0f}→{total:.0f} m³、周期 {old_period}→{period} 日"
+                f"（{'；'.join(parts) or '明细不变'}）；已供水上报与应急出库记录保留")
+        if reason:
+            line += f"。事由：{reason}"
+        plan.remark = (plan.remark + "\n" + line).strip()
+
+        db.commit()
+        db.refresh(plan)
+        return serialize_plan(db, plan)
+
+
 # ---------------- 3. 乡镇：确认优先级 ----------------
 def set_priority(db: Session, plan_id: int, body: dict) -> dict:
-    """乡镇为所辖配水条目确认供水优先级（1 最高，数字越小越优先）。"""
+    """乡镇为所辖配水条目确认供水优先级（1 最高，数字越小越优先）。
+
+    reviewed（审核后启动前）与 executing（滚动调整新增/调量后补确认）均可确认。
+    """
     _require_role(body.get("role", ""), ("township",), "确认供水优先级")
     plan = _get_plan(db, plan_id)
-    _require_status(plan, ("reviewed",), "确认优先级")
+    _require_status(plan, ("reviewed", "executing"), "确认优先级")
     alloc = (db.query(WaterSupplyAllocation)
              .filter(WaterSupplyAllocation.plan_id == plan_id,
                      WaterSupplyAllocation.township_id == int(body.get("township_id") or 0))
@@ -486,6 +653,9 @@ def report_delivery(db: Session, plan_id: int, body: dict) -> dict:
              .first())
     if alloc is None:
         raise HTTPException(404, "该乡镇不在本供水保障单配水范围中")
+    if not alloc.priority_confirmed:
+        raise HTTPException(409, f"乡镇「{alloc.township_name}」尚未确认供水优先级"
+                                 f"（滚动调整后须重新确认），确认后再上报实际供水")
     delivered = float(body.get("delivered_m3"))
     if delivered < 0:
         raise HTTPException(422, "实际供水量不能为负")
